@@ -1,0 +1,65 @@
+.profile {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  margin-left: auto;
+  padding: 7px 8px 7px 16px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(2, 6, 23, 0.28);
+}
+
+.greeting {
+  color: #cbd5e1;
+  font-size: 0.9rem;
+  font-weight: 550;
+}
+
+.profile button {
+  padding: 8px 13px;
+  border: 1px solid rgba(248, 113, 113, 0.32);
+  border-radius: 999px;
+  background: rgba(127, 29, 29, 0.2);
+  color: #fca5a5;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
+}
+
+.profile button:hover {
+  border-color: rgba(248, 113, 113, 0.58);
+  background: rgba(127, 29, 29, 0.4);
+  color: #fecaca;
+}
+
+.profile button:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 4px;
+}
+
+@media (max-width: 760px) {
+  .profile {
+    gap: 8px;
+    padding-left: 10px;
+  }
+
+  .greeting {
+    font-size: 0.82rem;
+  }
+
+  .profile button {
+    padding: 7px 10px;
+  }
+}
+
+@media (max-width: 480px) {
+  .greeting {
+    max-width: 112px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}

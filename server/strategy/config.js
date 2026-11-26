@@ -17,6 +17,7 @@ const CONFIG = {
     CANDLE_LOOKBACK_DAYS: 400,
     CANDLE_INTRADAY_INTERVALS: 1,
     API_DELAY_MS: 95,
+    API_CONCURRENT_LIMIT: 8,
 
     DEFENSIVE_SECTORS: new Set(["FMCG", "Pharma", "Healthcare", "Utilities", "Power"]),
 
@@ -57,7 +58,7 @@ const CONFIG = {
 
     // Daily Intraday (MIS / Product 'I') Rules
     INTRADAY: {
-        UNIVERSE_LIMIT: 50,             // Scan top 50 Nifty stocks for tightest spreads & instant fills
+        UNIVERSE_LIMIT: 50,             // Scan 50 highest-turnover names from the Nifty 200 universe
         INTERVAL_MINUTES: 1,
         RISK_PER_TRADE_PCT: 0.0035,     // Risk max 0.35% of total capital per intraday trade
         MAX_DAILY_LOSS_PCT: 0.01,       // Hard daily drawdown circuit breaker at -1.0% MTM loss

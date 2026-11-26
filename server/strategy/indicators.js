@@ -134,3 +134,40 @@ export function calculateCorrelation(returnsA, returnsB, lookback = 60) {
     }
     return da * db > 0 ? num / Math.sqrt(da * db) : 0;
 }
+
+export function calculateDatedCorrelation(seriesA, seriesB, lookback = 60, minObservations = 20) {
+    if (!Array.isArray(seriesA) || !Array.isArray(seriesB)) {
+        return null;
+    }
+
+    const valuesA = new Map(seriesA.map(({ date, value }) => [date, value]));
+    const paired = seriesB
+        .filter(({ date, value }) => valuesA.has(date) && Number.isFinite(value))
+        .map(({ date, value }) => [valuesA.get(date), value])
+        .filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b))
+        .slice(-lookback);
+
+    if (paired.length < minObservations) {
+        return null;
+    }
+
+    const meanA = sum(paired.map(([a]) => a)) / paired.length;
+    const meanB = sum(paired.map(([, b]) => b)) / paired.length;
+    let covariance = 0;
+    let varianceA = 0;
+    let varianceB = 0;
+
+    for (const [a, b] of paired) {
+        const deltaA = a - meanA;
+        const deltaB = b - meanB;
+        covariance += deltaA * deltaB;
+        varianceA += deltaA ** 2;
+        varianceB += deltaB ** 2;
+    }
+
+    if (varianceA === 0 || varianceB === 0) {
+        return null;
+    }
+
+    return covariance / Math.sqrt(varianceA * varianceB);
+}

@@ -5,7 +5,7 @@ import { calcDeliveryRoundTripCharges, calcIntradayRoundTripCharges } from "./ch
 import {
     calculateADX,
     calculateATR,
-    calculateCorrelation,
+    calculateDatedCorrelation,
     calculateEMA,
     calculateRSI,
     calculateRiskMetrics,
@@ -13,10 +13,26 @@ import {
     calculateSessionVWAP
 } from "./indicators.js";
 import { cancelStaleOrders, executeOrders } from "./executor.js";
-import { getISTTime, roundToTick, sleep, sum } from "./utils.js";
+import { getISTTime, roundToTick, sum } from "./utils.js";
 import getNifty200 from "../service/nifty200.js";
 
 let warnings = [];
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+    const results = [];
+    let index = 0;
+
+    async function worker() {
+        while (index < items.length) {
+            const currentIndex = index++;
+            results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+        }
+    }
+
+    const workerCount = Math.min(concurrency, items.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return results;
+}
 
 // ============================================================================
 // 1. UNCONSTRAINED POSITION SIZING (RISK-PARITY & BUDGET BOUNDED)
@@ -57,7 +73,8 @@ function buildWeeklyCandles(dailyCandles) {
     let bucket = null;
 
     for (const c of dailyCandles) {
-        const d = new Date(c.ts || c.date);
+        const sessionDate = String(c.ts || c.date).slice(0, 10);
+        const d = new Date(`${sessionDate}T00:00:00Z`);
         const day = d.getUTCDay() || 7;
         const monday = new Date(d);
         monday.setUTCDate(d.getUTCDate() - day + 1);
@@ -118,9 +135,34 @@ async function getMacroRegime(accessToken) {
         closes.length > d ? (price - closes[closes.length - 1 - d]) / closes[closes.length - 1 - d] : 0;
 
     const vixCloses = vixCandles.map((c) => c.close);
-    const vix = vixCloses[vixCloses.length - 1] || 15;
+    const vix = vixCloses[vixCloses.length - 1] || 0;
     const vixSma10 = calculateSMA(vixCloses, 10) || vix;
     const isVixSpiking = vix > vixSma10 * 1.15;
+    const now = Date.now();
+    const candleTimestamp = (candle) => new Date(candle?.ts || candle?.date).getTime();
+    const latestNiftyAge = now - candleTimestamp(niftyDaily[niftyDaily.length - 1]);
+    const latestVixAge = now - candleTimestamp(vixCandles[vixCandles.length - 1]);
+    const currentDate = getISTTime().date;
+    const latestIntraday = niftyIntraday1m[niftyIntraday1m.length - 1];
+    const latestIntradayDate = String(latestIntraday?.ts || latestIntraday?.date || "").slice(0, 10);
+    const latestIntradayAge = now - candleTimestamp(latestIntraday);
+    const hasValidDailyContext =
+        closes.length >= 200 &&
+        Number.isFinite(price) &&
+        price > 0 &&
+        Number.isFinite(vix) &&
+        vix > 0 &&
+        Number.isFinite(latestNiftyAge) &&
+        latestNiftyAge >= -2 * 60 * 1000 &&
+        latestNiftyAge <= 7 * 24 * 60 * 60 * 1000 &&
+        Number.isFinite(latestVixAge) &&
+        latestVixAge >= -2 * 60 * 1000 &&
+        latestVixAge <= 7 * 24 * 60 * 60 * 1000;
+    const hasLiveIntradayData =
+        latestIntradayDate === currentDate &&
+        Number.isFinite(latestIntradayAge) &&
+        latestIntradayAge >= -2 * 60 * 1000 &&
+        latestIntradayAge <= 15 * 60 * 1000;
 
     let vixRegime = "NORMAL";
     let sizeScale = 1.0;
@@ -156,12 +198,16 @@ async function getMacroRegime(accessToken) {
         currentVix: Number(vix.toFixed(2)),
         vixSma10: Number(vixSma10.toFixed(2)),
         vixRegime,
-        allowDeliveryBuys: vix < 24 && isLongTermUp && isNiftyWeeklyUp,
-        allowIntradayTrades: vix < 24,
-        sizeScale,
+        hasValidDailyContext,
+        hasLiveIntradayData,
+        allowDeliveryBuys: hasValidDailyContext && hasLiveIntradayData && vix < 24 && isLongTermUp && isNiftyWeeklyUp,
+        allowIntradayTrades: hasValidDailyContext && hasLiveIntradayData && vix < 24,
+        sizeScale: hasValidDailyContext ? sizeScale : 0,
         hardStop,
         atrMult,
-        regimeMultiplier: (isNiftyBullish ? 1.0 : 0.85) * (vix >= 18 ? 0.85 : 1.0)
+        regimeMultiplier: hasValidDailyContext
+            ? (isNiftyBullish ? 1.0 : 0.85) * (vix >= 18 ? 0.85 : 1.0)
+            : 0
     };
 }
 
@@ -174,7 +220,14 @@ export function buildHistorical1mProfile(histCandles1m) {
         return null;
     }
 
-    // Group 1-min bars by IST session date (YYYY-MM-DD) & build time-of-day volume map
+    const todayIST = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Kolkata",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+    }).format(new Date());
+
+    // Group 1-min bars by IST session date & exclude today's partial session from baselines.
     const sessionsMap = new Map();
     const slotVolumes = new Map(); // "HH:MM" -> [vol1, vol2, ...]
 
@@ -188,7 +241,7 @@ export function buildHistorical1mProfile(histCandles1m) {
         }
         sessionsMap.get(sessionDate).push(c);
 
-        if (hhmm) {
+        if (hhmm && sessionDate < todayIST) {
             if (!slotVolumes.has(hhmm)) {
                 slotVolumes.set(hhmm, []);
             }
@@ -202,13 +255,6 @@ export function buildHistorical1mProfile(histCandles1m) {
     }
 
     // Exclude today's date if present in historical payload so PDH/PDL strictly reflects prior day
-    const todayIST = new Intl.DateTimeFormat("en-CA", {
-        timeZone: "Asia/Kolkata",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit"
-    }).format(new Date());
-
     const completedDates = sortedDates.filter((d) => d < todayIST);
     const prevDate = completedDates[completedDates.length - 1];
     const prevDayBars = sessionsMap.get(prevDate) || [];
@@ -239,10 +285,15 @@ export function buildHistorical1mProfile(histCandles1m) {
     const high5D = Math.max(...last5Bars.map((b) => b.high));
     const low5D = Math.min(...last5Bars.map((b) => b.low));
 
-    // Average volume per exact clock minute across last month
+    // Median volume per exact clock minute is less sensitive to outlier sessions.
     const avgSlotVolumeMap = new Map();
     for (const [hhmm, vols] of slotVolumes.entries()) {
-        avgSlotVolumeMap.set(hhmm, sum(vols) / vols.length);
+        const sortedVolumes = [...vols].sort((a, b) => a - b);
+        const middle = Math.floor(sortedVolumes.length / 2);
+        const median = sortedVolumes.length % 2
+            ? sortedVolumes[middle]
+            : (sortedVolumes[middle - 1] + sortedVolumes[middle]) / 2;
+        avgSlotVolumeMap.set(hhmm, median);
     }
 
     // Baseline 1-min ATR & 200-bar 1-min EMA from recent 1,500 historical 1-min candles
@@ -310,6 +361,12 @@ export function buildLiveDailySeries(dailyCandles, intradayCandles1m) {
 
     const vwap = calculateSessionVWAP(intradayCandles1m);
     const minutesElapsed = Math.max(1, intradayCandles1m.length);
+    const lastBarTimestamp = new Date(lastBar.ts || lastBar.date).getTime();
+    const hasFreshSessionData =
+        todayDate === getISTTime().date &&
+        Number.isFinite(lastBarTimestamp) &&
+        Date.now() - lastBarTimestamp >= -2 * 60 * 1000 &&
+        Date.now() - lastBarTimestamp <= 15 * 60 * 1000;
     // NSE cash market session is 375 minutes (09:15 to 15:30 IST)
     const projectedFullDayVolume = (todayVolume / minutesElapsed) * 375;
 
@@ -322,6 +379,7 @@ export function buildLiveDailySeries(dailyCandles, intradayCandles1m) {
             livePrice: lastBar.close,
             todayVolume,
             projectedFullDayVolume,
+            hasFreshSessionData,
             vwap,
             vwapSpreadPct: vwap > 0 ? (lastBar.close - vwap) / vwap : 0,
             isAboveVwap: lastBar.close >= vwap,
@@ -334,22 +392,53 @@ export function buildLiveDailySeries(dailyCandles, intradayCandles1m) {
 // 5. PORTFOLIO & DATA LOADERS
 // ============================================================================
 async function fetchPortfolio(accessToken) {
-    const [holdingsRaw, positionsRaw, fundsRaw, ordersRaw] = await Promise.all([
+    const results = await Promise.allSettled([
         getHoldings(accessToken),
         getPositions(accessToken),
-        // getFunds(accessToken),
+        getFunds(accessToken),
         getOrders(accessToken)
     ]);
+
+    const [holdingsResult, positionsResult, fundsResult, ordersResult] = results;
+    const holdingsRaw = holdingsResult.status === "fulfilled" ? holdingsResult.value : [];
+    const positionsRaw = positionsResult.status === "fulfilled" ? positionsResult.value : [];
+    const ordersRaw = ordersResult.status === "fulfilled" ? ordersResult.value : [];
+    const fundsRaw = fundsResult.status === "fulfilled" ? fundsResult.value : null;
 
     const holdings = Array.isArray(holdingsRaw) ? holdingsRaw : [];
     const positions = Array.isArray(positionsRaw) ? positionsRaw : [];
     const orders = Array.isArray(ordersRaw) ? ordersRaw : [];
-    const availableCash = 30000
-        // fundsRaw?.equity?.available_margin ??
-        // fundsRaw?.available_to_trade?.total ??
-        // 0;
 
-    return { holdings, positions, orders, availableCash };
+    if (holdingsResult.status === "rejected") warnings.push("Holdings unavailable; existing holdings could not be reviewed.");
+    if (positionsResult.status === "rejected") warnings.push("Positions unavailable; intraday and delivery positions could not be reviewed.");
+    if (fundsResult.status === "rejected") warnings.push("Funds unavailable; new entries will be disabled.");
+    if (ordersResult.status === "rejected") warnings.push("Order book unavailable; duplicate-order protection is degraded.");
+
+    const availableCash = Number(
+        fundsRaw?.equity?.available_margin ??
+        fundsRaw?.equity?.available_cash ??
+        fundsRaw?.equity?.available_balance ??
+        fundsRaw?.available_to_trade?.total ??
+        fundsRaw?.available_margin ??
+        0
+    );
+
+    const portfolioDataComplete =
+        results.every((result) => result.status === "fulfilled") &&
+        Array.isArray(holdingsRaw) &&
+        Array.isArray(positionsRaw) &&
+        Array.isArray(ordersRaw) &&
+        fundsRaw !== null &&
+        typeof fundsRaw === "object" &&
+        !Array.isArray(fundsRaw);
+
+    return {
+        holdings,
+        positions,
+        orders,
+        portfolioDataComplete,
+        availableCash: Number.isFinite(availableCash) && availableCash > 0 ? availableCash : 0
+    };
 }
 
 function consolidateDelivery(holdings, positions) {
@@ -431,10 +520,9 @@ function getUniverseMap(nifty200, deliveryMap) {
 
 async function getMetricsMap(universeMap, macro) {
     const metricsMap = new Map();
+    const entries = Array.from(universeMap.entries());
 
-    for (const [key, meta] of universeMap.entries()) {
-        await sleep(CONFIG.API_DELAY_MS);
-
+    await mapWithConcurrency(entries, CONFIG.API_CONCURRENT_LIMIT, async ([key, meta]) => {
         const [dailyCandles, intradayCandles1m] = await Promise.all([
             fetchHistoricalCandles(key, CONFIG.CANDLE_LOOKBACK_DAYS),
             fetchIntradayCandles(key, CONFIG.CANDLE_INTRADAY_INTERVALS)
@@ -443,14 +531,14 @@ async function getMetricsMap(universeMap, macro) {
         const { mergedDaily, intradayContext } = buildLiveDailySeries(dailyCandles, intradayCandles1m);
 
         if (!mergedDaily || mergedDaily.length < 160) {
-            continue;
+            return;
         }
 
         const scored = scoreDeliveryStock(mergedDaily, intradayContext, meta, macro);
         if (scored) {
             metricsMap.set(key, { meta, intradayContext, ...scored });
         }
-    }
+    });
 
     return metricsMap;
 }
@@ -465,7 +553,6 @@ function scoreDeliveryStock(candles, intradayContext, meta, macro) {
 
     const closes = candles.map((c) => c.close);
     const highs = candles.map((c) => c.high);
-    const volumes = candles.map((c) => c.volume);
     const price = intradayContext?.livePrice || closes[closes.length - 1];
     const prevClose = closes[closes.length - 2];
     const at = (d) => closes[closes.length - 1 - d];
@@ -475,7 +562,7 @@ function scoreDeliveryStock(candles, intradayContext, meta, macro) {
 
     const ema20 = calculateEMA(closes, 20);
     const ema50 = calculateEMA(closes, 50);
-    const ema200 = calculateEMA(closes, Math.min(200, closes.length));
+    const ema200 = calculateEMA(closes, 200) || ema50;
     const adx = calculateADX(candles, 14);
     const high52 = Math.max(...highs.slice(-252));
 
@@ -503,7 +590,16 @@ function scoreDeliveryStock(candles, intradayContext, meta, macro) {
         (alpha3M > 0.05 ? 9 : alpha3M > 0 ? 5 : 0);
 
     // 3. Downside Sortino + High-VIX Defensive Tilt (20 pts)
-    const { sortino, dailyReturns } = calculateRiskMetrics(closes);
+    const todayIST = getISTTime().date;
+    const completedCandles = candles.filter((candle) =>
+        String(candle.date || candle.ts).slice(0, 10) < todayIST
+    );
+    const completedCloses = completedCandles.map((candle) => candle.close);
+    const { sortino } = calculateRiskMetrics(completedCloses);
+    const returnSeries = completedCandles.slice(1).map((candle, index) => ({
+        date: String(candle.date || candle.ts).slice(0, 10),
+        value: (completedCloses[index + 1] - completedCloses[index]) / completedCloses[index]
+    }));
     let riskScore = sortino > 2.0 ? 20 : sortino > 1.2 ? 15 : sortino > 0.5 ? 8 : 0;
     if (macro.currentVix >= 18 && CONFIG.DEFENSIVE_SECTORS.has(meta.sector)) {
         riskScore = Math.min(20, riskScore + 5);
@@ -517,22 +613,26 @@ function scoreDeliveryStock(candles, intradayContext, meta, macro) {
     else if (rsi > 74) timingScore = 2;
     else if (rsi >= 35 && price > weeklyEma10) timingScore = 11;
 
-    // 5. Institutional Volume Accumulation (uses projected full-day volume during live session)
-    const completedVols = volumes.slice(-21, -1);
+    // Use completed-session volume only; partial-day projections distort intraday scoring.
+    const completedVols = completedCandles.map((candle) => candle.volume).slice(-20);
     const avgVol20 = sum(completedVols) / Math.max(1, completedVols.length);
-    const liveDayVol = intradayContext?.projectedFullDayVolume || volumes[volumes.length - 1];
-    const recent5Vol = (sum(volumes.slice(-5, -1)) + liveDayVol) / 5;
+    const recent5Vol = sum(completedVols.slice(-5)) / Math.max(1, Math.min(5, completedVols.length));
     const volRatio = avgVol20 > 0 ? recent5Vol / avgVol20 : 1;
+    const recentTurnover = completedCandles.slice(-20).map((candle) => candle.close * candle.volume);
+    const avgDailyTradedValue =
+        recentTurnover.length > 0 ? sum(recentTurnover) / recentTurnover.length : 0;
     const chg5D = (price - at(5)) / at(5);
     const flowScore = volRatio > 1.2 && chg5D > 0 ? 15 : volRatio > 1.2 && chg5D < 0 ? 0 : 7;
 
     // Intraday Entry Timing Check for New Delivery Swing Buys:
     // Must hold above Session VWAP & today's Open, and not be overextended (> +2.5% above VWAP)
     const passesIntradayTiming =
-        !intradayContext ||
-        (intradayContext.isAboveVwap &&
-            intradayContext.isGreenDay &&
-            intradayContext.vwapSpreadPct <= 0.025);
+        macro.hasLiveIntradayData &&
+        intradayContext != null &&
+        intradayContext.hasFreshSessionData &&
+        intradayContext.isAboveVwap &&
+        intradayContext.isGreenDay &&
+        intradayContext.vwapSpreadPct <= 0.025;
 
     const atr14 = calculateATR(candles, 14);
     const recentPeak = Math.max(...highs.slice(-20));
@@ -557,7 +657,8 @@ function scoreDeliveryStock(candles, intradayContext, meta, macro) {
         atrTrailingStop: Number(Math.max(chandelierStop, emaTrailFloor).toFixed(2)),
         entryStop: Number((price - macro.atrMult * atr14).toFixed(2)),
         targetPrice: Number((price + macro.atrMult * atr14 * 2.2).toFixed(2)),
-        dailyReturns
+        avgDailyTradedValue,
+        returnSeries
     };
 }
 
@@ -570,6 +671,17 @@ function evaluateIntradaySignal(candles1m, histCandles1m, meta, macro) {
     }
 
     const histProfile = buildHistorical1mProfile(histCandles1m);
+    const today = getISTTime().date;
+    const now = Date.now();
+    candles1m = candles1m.filter((c) => {
+        const timestamp = new Date(c.ts || c.date).getTime();
+        return String(c.ts || c.date).slice(0, 10) === today &&
+            Number.isFinite(timestamp) &&
+            timestamp + 60 * 1000 <= now;
+    });
+    if (candles1m.length < 35) {
+        return null;
+    }
 
     // Stitch last 200 historical 1-min candles before today's candles so EMA50/EMA200
     // and RSI are fully warmed up right from 09:45 AM without cold-start distortion
@@ -579,7 +691,6 @@ function evaluateIntradaySignal(candles1m, histCandles1m, meta, macro) {
             : candles1m;
 
     const stitchedCloses = stitchedCandles.map((c) => c.close);
-    const volumes = candles1m.map((c) => c.volume);
     const last = candles1m[candles1m.length - 1];
     const prev = candles1m[candles1m.length - 2];
     const price = last.close;
@@ -602,17 +713,32 @@ function evaluateIntradaySignal(candles1m, histCandles1m, meta, macro) {
         return null;
     }
 
-    // Opening Range = First 30 minutes of today's session (09:15 to 09:45 IST)
-    const orbSlice = candles1m.slice(0, 30);
+    const sessionCandles = candles1m;
+
+    const firstBarTime = String(sessionCandles[0].ts || sessionCandles[0].date).slice(11, 16);
+    const lastBarTime = String(sessionCandles[sessionCandles.length - 1].ts || sessionCandles[sessionCandles.length - 1].date).slice(11, 16);
+    if (firstBarTime > "09:16" || lastBarTime < "09:45") {
+        return null;
+    }
+
+    // Use the clock-time opening range, not the first 30 bars if the feed starts late.
+    const orbSlice = sessionCandles.filter((c) => {
+        const hhmm = String(c.ts || c.date).slice(11, 16);
+        return hhmm >= "09:15" && hhmm < "09:45";
+    });
+    if (orbSlice.length < 24) {
+        return null;
+    }
     const orbHigh = Math.max(...orbSlice.map((c) => c.high));
     const orbLow = Math.min(...orbSlice.map((c) => c.low));
 
     // Volume Surge: Combine rolling 20-min volume AND 30-day exact clock-minute average
-    const recentVolWindow = volumes.slice(-21, -1);
+    const sessionVolumes = sessionCandles.map((c) => c.volume);
+    const recentVolWindow = sessionVolumes.slice(-21, -1);
     const avgVol20m = sum(recentVolWindow) / Math.max(1, recentVolWindow.length);
-    const rollingSurge = avgVol20m > 0 ? last.volume / avgVol20m : 1;
+    const rollingSurge = avgVol20m > 0 ? sessionVolumes[sessionVolumes.length - 1] / avgVol20m : 1;
 
-    const currentHHMM = String(last.ts).slice(11, 16);
+    const currentHHMM = String(sessionCandles[sessionCandles.length - 1].ts || sessionCandles[sessionCandles.length - 1].date).slice(11, 16);
     const histSlotAvgVol = histProfile?.avgSlotVolumeMap?.get(currentHHMM) || avgVol20m;
     const slotSurge = histSlotAvgVol > 0 ? last.volume / histSlotAvgVol : rollingSurge;
     const volSurge = rollingSurge * 0.5 + slotSurge * 0.5;
@@ -691,7 +817,7 @@ function evaluateIntradaySignal(candles1m, histCandles1m, meta, macro) {
 
     // Setup C: Trend Pullback to VWAP or Previous Day VWAP
     const distFromVwapATR = Math.abs(price - vwap) / atr;
-    if (!setup && adx >= 24 && distFromVwapATR <= 0.6 && volSurge >= 1.3) {
+    if (!setup && adx >= 24 && distFromVwapATR <= 0.6 && volSurge >= CONFIG.INTRADAY.MIN_VOL_SURGE) {
         if (
             macro.isNiftyBullish &&
             ema20 > ema50 &&
@@ -729,11 +855,11 @@ function evaluateIntradaySignal(candles1m, histCandles1m, meta, macro) {
         if (signedVwapATR <= -3.5 && rsi < 22 && last.close > last.open) {
             setup = "VWAP_1M_OVERSOLD_BOUNCE";
             direction = "BUY";
-            confidence = 72;
+            confidence = 74;
         } else if (signedVwapATR >= 3.5 && rsi > 78 && last.close < last.open) {
             setup = "VWAP_1M_OVERBOUGHT_FADE";
             direction = "SELL";
-            confidence = 72;
+            confidence = 74;
         }
     }
 
@@ -742,7 +868,11 @@ function evaluateIntradaySignal(candles1m, histCandles1m, meta, macro) {
     }
 
     const stopDist = CONFIG.INTRADAY.ATR_STOP_MULT * atr;
-    const targetDist = CONFIG.INTRADAY.ATR_TARGET_MULT * atr;
+    const targetDist = (
+        setup === "VWAP_1M_OVERSOLD_BOUNCE" || setup === "VWAP_1M_OVERBOUGHT_FADE"
+            ? 2.8
+            : CONFIG.INTRADAY.ATR_TARGET_MULT
+    ) * atr;
 
     return {
         symbol: meta.symbol,
@@ -784,6 +914,7 @@ function evaluateDeliverys(
     const keptReturns = [];
     const sectorValues = {};
     let keptCount = 0;
+    let correlationCoverageIncomplete = false;
     let corrId = 1;
 
     // A1. Evaluate Existing Delivery Holdings for Exit, Daily Harvest & Stop-Loss Sync
@@ -793,6 +924,7 @@ function evaluateDeliverys(
 
         if (!m) {
             warnings.push(`Missing historical data for ${held.symbol}; left untouched.`);
+            correlationCoverageIncomplete = true;
             keptCount++;
             sectorValues[sec] = (sectorValues[sec] || 0) + held.currentValue;
             continue;
@@ -800,6 +932,7 @@ function evaluateDeliverys(
 
         if (m.hasSplitAnomaly) {
             warnings.push(`MANUAL_REVIEW: ${held.symbol} dropped >35% overnight (verify stock split/bonus).`);
+            correlationCoverageIncomplete = true;
             keptCount++;
             sectorValues[sec] = (sectorValues[sec] || 0) + held.currentValue;
             continue;
@@ -821,13 +954,13 @@ function evaluateDeliverys(
         }
 
         const hasPendingExit = orderState.activeExitKeys.has(`D:${key}`);
+        const hasProtectiveStop = orderState.activeStopLossKeys.has(`D:${key}`);
+        const shouldExit =
+            price <= activeStop ||
+            (m.finalScore < CONFIG.DELIVERY.MIN_SCORE_HOLD && price < m.weeklyEma10 && price < m.ema50);
 
         // 1. Stop-Loss or Weekly Trend Breakdown -> Full Exit
-        if (
-            !hasPendingExit &&
-            (price <= activeStop ||
-                (m.finalScore < CONFIG.DELIVERY.MIN_SCORE_HOLD && price < m.weeklyEma10 && price < m.ema50))
-        ) {
+        if (!hasPendingExit && shouldExit) {
             exitOrders.push({
                 correlation_id: `d_exit_${corrId++}`,
                 quantity: held.quantity,
@@ -848,7 +981,6 @@ function evaluateDeliverys(
             });
             continue;
         }
-
         let remQty = held.quantity;
         let remVal = remQty * price;
 
@@ -890,7 +1022,7 @@ function evaluateDeliverys(
         if (totalValue > 0 && remVal / totalValue > CONFIG.DELIVERY.MAX_STOCK_WEIGHT) {
             const excess = remVal - totalValue * CONFIG.DELIVERY.MAX_STOCK_WEIGHT;
             const trimQty = Math.floor(excess / price);
-            if (!hasPendingExit && trimQty >= 1 && trimQty < remQty && trimQty * price >= CONFIG.MIN_ORDER_VALUE) {
+            if (!hasPendingExit && !hasProtectiveStop && trimQty >= 1 && trimQty < remQty && trimQty * price >= CONFIG.MIN_ORDER_VALUE) {
                 const trimCharges = calcDeliveryRoundTripCharges(held.avgPrice, price, trimQty);
                 exitOrders.push({
                     correlation_id: `d_reb_${corrId++}`,
@@ -916,7 +1048,7 @@ function evaluateDeliverys(
         }
 
         // 4. Attach Broker-Side Protective SL for Remaining Delivery Shares
-        if (remQty > 0 && !orderState.activeStopLossKeys.has(`D:${key}`) && clock.time < "15:15") {
+        if (remQty > 0 && !hasPendingExit && !hasProtectiveStop && clock.time < "15:15") {
             const slTrigger = roundToTick(activeStop);
             protectiveStopOrders.push({
                 correlation_id: `d_sl_${corrId++}`,
@@ -936,12 +1068,17 @@ function evaluateDeliverys(
 
         keptCount++;
         sectorValues[sec] = (sectorValues[sec] || 0) + remVal;
-        keptReturns.push({ symbol: held.symbol, returns: m.dailyReturns });
+        keptReturns.push({ symbol: held.symbol, returns: m.returnSeries });
     }
 
-    // A2. Screen Full Nifty 100 for New Weekly Swing Delivery Buys
+    // A2. Screen the Nifty 200 universe for New Weekly Swing Delivery Buys
     const inMarketHours = clock.time >= CONFIG.DELIVERY.ENTRY_START_IST && clock.time <= CONFIG.DELIVERY.ENTRY_END_IST;
-    if (inMarketHours && macro.allowDeliveryBuys && keptCount < CONFIG.DELIVERY.MAX_HOLDINGS) {
+    if (
+        inMarketHours &&
+        macro.allowDeliveryBuys &&
+        !correlationCoverageIncomplete &&
+        keptCount < CONFIG.DELIVERY.MAX_HOLDINGS
+    ) {
         const candidates = [];
         for (const stock of nifty200) {
             const m = metricsMap.get(stock.instrumentKey);
@@ -964,10 +1101,12 @@ function evaluateDeliverys(
         const reserveCash = totalValue * CONFIG.CASH_RESERVE_PCT;
         const intradayReserve = Math.min(availableCash, totalValue * CONFIG.INTRADAY_CAPITAL_SHARE);
         let deployableCash = Math.max(0, availableCash - reserveCash - intradayReserve);
-        const buySlots = Math.min(
-            CONFIG.DELIVERY.MAX_HOLDINGS - keptCount,
+        const pendingDeliveryEntries = Array.from(orderState.activeEntryKeys)
+            .filter((key) => key.startsWith("D:")).length;
+        const buySlots = Math.max(0, Math.min(
+            CONFIG.DELIVERY.MAX_HOLDINGS - keptCount - pendingDeliveryEntries,
             CONFIG.DELIVERY.MAX_NEW_BUYS_PER_RUN
-        );
+        ));
 
         for (const { stock, m } of candidates) {
             if (entryOrders.length >= buySlots) {
@@ -975,49 +1114,60 @@ function evaluateDeliverys(
             }
 
             let maxCorr = 0;
+            let correlationUnavailable = false;
             for (const ex of keptReturns) {
-                maxCorr = Math.max(maxCorr, calculateCorrelation(m.dailyReturns, ex.returns, 60));
+                const correlation = calculateDatedCorrelation(m.returnSeries, ex.returns, 60);
+                if (correlation === null) {
+                    correlationUnavailable = true;
+                    break;
+                }
+                maxCorr = Math.max(maxCorr, correlation);
+            }
+            if (correlationUnavailable) {
+                warnings.push(`Skipped ${stock.symbol}: insufficient aligned return history for portfolio correlation.`);
+                continue;
             }
             if (maxCorr > CONFIG.DELIVERY.MAX_CORRELATION) {
                 continue;
             }
 
+            const entryPrice = roundToTick(m.currentPrice * 1.0015);
             const riskBudget = totalValue * CONFIG.DELIVERY.RISK_PER_TRADE_PCT * macro.sizeScale;
-            const stopDist = m.currentPrice - m.entryStop;
+            const stopDist = entryPrice - m.entryStop;
             const riskQty = stopDist > 0 ? Math.floor(riskBudget / stopDist) : 0;
             const capQty = Math.floor(
-                (totalValue * CONFIG.DELIVERY.NEW_ENTRY_MAX_WEIGHT * macro.sizeScale) / m.currentPrice
+                (totalValue * CONFIG.DELIVERY.NEW_ENTRY_MAX_WEIGHT * macro.sizeScale) / entryPrice
             );
             const sectorRoom =
                 totalValue * CONFIG.DELIVERY.MAX_SECTOR_WEIGHT - (sectorValues[stock.sector] || 0);
-            const sectorQty = Math.floor(sectorRoom / m.currentPrice);
+            const sectorQty = Math.floor(sectorRoom / entryPrice);
 
             const qty = calculatePositionQty(
                 Math.min(riskQty, capQty, sectorQty),
-                m.currentPrice,
+                entryPrice,
                 deployableCash
             );
             if (qty === 0) {
                 continue;
             }
 
-            const orderValue = qty * m.currentPrice;
-            const expectedGrossGain = (m.targetPrice - m.currentPrice) * qty;
-            const estCharges = calcDeliveryRoundTripCharges(m.currentPrice, m.targetPrice, qty);
+            const orderValue = qty * entryPrice;
+            const expectedGrossGain = (m.targetPrice - entryPrice) * qty;
+            const estCharges = calcDeliveryRoundTripCharges(entryPrice, m.targetPrice, qty);
             if (expectedGrossGain < estCharges * CONFIG.DELIVERY.MIN_REWARD_TO_CHARGES) {
                 continue;
             }
 
             deployableCash -= orderValue;
             sectorValues[stock.sector] = (sectorValues[stock.sector] || 0) + orderValue;
-            keptReturns.push({ symbol: stock.symbol, returns: m.dailyReturns });
+            keptReturns.push({ symbol: stock.symbol, returns: m.returnSeries });
 
             entryOrders.push({
                 correlation_id: `d_buy_${corrId++}`,
                 quantity: qty,
                 product: "D",
                 validity: "DAY",
-                price: roundToTick(m.currentPrice * 1.0015),
+                price: entryPrice,
                 trigger_price: 0,
                 order_type: "LIMIT",
                 transaction_type: "BUY",
@@ -1039,7 +1189,7 @@ function evaluateDeliverys(
 // ============================================================================
 // 7. INTRADAY ('I') EVALUATION (FETCHES BOTH LIVE & 30D 1-MIN CANDLES)
 // ============================================================================
-async function evaluateIntraday(accessToken, positions, macro, orderState, clock, availableCash, totalValue, nifty200) {
+async function evaluateIntraday(accessToken, positions, macro, orderState, clock, availableCash, totalValue, nifty200, metricsMap) {
     const intradayPositions = positions.filter((p) => p.product === "I" && p.quantity !== 0);
     const intradayTotalPnL = positions
         .filter((p) => p.product === "I")
@@ -1050,6 +1200,7 @@ async function evaluateIntraday(accessToken, positions, macro, orderState, clock
 
     const exitOrders = [];
     const entryOrders = [];
+    const protectiveStopOrders = [];
     let corrId = 500;
 
     // 1. Manage Open Intraday Positions
@@ -1064,6 +1215,31 @@ async function evaluateIntraday(accessToken, positions, macro, orderState, clock
         const estCharges = calcIntradayRoundTripCharges(pos.average_price, ltp, qty);
         const netPosPnL = (isLong ? ltp - pos.average_price : pos.average_price - ltp) * qty - estCharges;
         const hasPendingExit = orderState.activeExitKeys.has(`I:${pos.instrument_token}`);
+        const hasProtectiveStop = orderState.activeStopLossKeys.has(`I:${pos.instrument_token}`);
+
+        if (
+            !hasPendingExit &&
+            !hasProtectiveStop &&
+            clock.time < CONFIG.INTRADAY.SQUARE_OFF_IST &&
+            movePct > -0.01 &&
+            movePct < 0.014
+        ) {
+            const stopTrigger = roundToTick(isLong ? pos.average_price * 0.99 : pos.average_price * 1.01);
+            protectiveStopOrders.push({
+                correlation_id: `i_sl_${corrId++}`,
+                quantity: qty,
+                product: "I",
+                validity: "DAY",
+                price: roundToTick(isLong ? stopTrigger * 0.997 : stopTrigger * 1.003),
+                trigger_price: stopTrigger,
+                order_type: "SL",
+                transaction_type: isLong ? "SELL" : "BUY",
+                instrument_token: pos.instrument_token,
+                disclosed_quantity: 0,
+                tag: "pigtrader_sl",
+                _meta: { symbol: pos.trading_symbol, stopLoss: stopTrigger }
+            });
+        }
 
         if (
             !hasPendingExit &&
@@ -1094,7 +1270,12 @@ async function evaluateIntraday(accessToken, positions, macro, orderState, clock
     }
 
     // 2. Scan for New Intraday Entries using Today's 1-Min + Last Month's 1-Min Candles
-    const openIntradaySlots = Math.max(0, CONFIG.INTRADAY.MAX_OPEN_TRADES - intradayPositions.length);
+    const pendingIntradayEntries = Array.from(orderState.activeEntryKeys)
+        .filter((key) => key.startsWith("I:")).length;
+    const openIntradaySlots = Math.max(
+        0,
+        CONFIG.INTRADAY.MAX_OPEN_TRADES - intradayPositions.length - pendingIntradayEntries
+    );
     const inIntradayWindow =
         clock.time >= CONFIG.INTRADAY.ENTRY_START_IST && clock.time <= CONFIG.INTRADAY.ENTRY_END_IST;
 
@@ -1106,20 +1287,27 @@ async function evaluateIntraday(accessToken, positions, macro, orderState, clock
         warnings.push(
             `Daily intraday profit target (+1.8%) achieved (₹${intradayTotalPnL.toFixed(2)}). Trading paused to lock gains.`
         );
-    } else if (!dailyLossBreached && macro.allowIntradayTrades && openIntradaySlots > 0) {
+    } else if (dailyLossBreached) {
+        warnings.push(
+            `Daily intraday loss limit (${CONFIG.INTRADAY.MAX_DAILY_LOSS_PCT * 100}% of total value) breached (₹${intradayTotalPnL.toFixed(2)}). New entries paused.`
+        );
+    } else if (macro.allowIntradayTrades && openIntradaySlots > 0) {
         const activeIntradayKeys = new Set(intradayPositions.map((p) => p.instrument_token));
         const signals = [];
 
-        // for (const stock of NIFTY_100.slice(0, CONFIG.INTRADAY.UNIVERSE_LIMIT)) {
-        for (const stock of nifty200) {
-            if (
-                activeIntradayKeys.has(stock.instrumentKey) ||
-                orderState.activeEntryKeys.has(`I:${stock.instrumentKey}`)
-            ) {
-                continue;
-            }
+        const intradayCandidates = nifty200
+            .filter((stock) =>
+                !activeIntradayKeys.has(stock.instrumentKey) &&
+                !orderState.activeEntryKeys.has(`I:${stock.instrumentKey}`) &&
+                (metricsMap.get(stock.instrumentKey)?.avgDailyTradedValue || 0) > 0
+            )
+            .sort((a, b) =>
+                metricsMap.get(b.instrumentKey).avgDailyTradedValue -
+                metricsMap.get(a.instrumentKey).avgDailyTradedValue
+            )
+            .slice(0, CONFIG.INTRADAY.UNIVERSE_LIMIT);
 
-            await sleep(75);
+        await mapWithConcurrency(intradayCandidates, CONFIG.API_CONCURRENT_LIMIT, async (stock) => {
             const [candles1m, histCandles1m] = await Promise.all([
                 fetchIntradayCandles(stock.instrumentKey, CONFIG.CANDLE_INTRADAY_INTERVALS),
                 fetchHistoricalIntradayCandles(stock.instrumentKey, 30)
@@ -1129,7 +1317,7 @@ async function evaluateIntraday(accessToken, positions, macro, orderState, clock
             if (sig) {
                 signals.push(sig);
             }
-        }
+        });
 
         signals.sort((a, b) => b.confidence - a.confidence);
 
@@ -1137,23 +1325,36 @@ async function evaluateIntraday(accessToken, positions, macro, orderState, clock
         let buyingPower = intradayPool * CONFIG.INTRADAY.MAX_LEVERAGE;
 
         for (const sig of signals) {
+            if (sig.confidence < 74) {
+                continue;
+            }
             if (entryOrders.length >= openIntradaySlots) {
                 break;
             }
 
+            const entryPrice = roundToTick(
+                sig.direction === "BUY" ? sig.entryPrice * 1.0015 : sig.entryPrice * 0.9985
+            );
             const riskBudget = totalValue * CONFIG.INTRADAY.RISK_PER_TRADE_PCT * macro.sizeScale;
-            const riskQty = Math.floor(riskBudget / sig.stopDist);
-            const qty = calculatePositionQty(riskQty, sig.entryPrice, buyingPower / openIntradaySlots, true);
+            const riskPerShare = sig.direction === "BUY"
+                ? entryPrice - sig.stopLoss
+                : sig.stopLoss - entryPrice;
+            const riskQty = riskPerShare > 0 ? Math.floor(riskBudget / riskPerShare) : 0;
+            const qty = calculatePositionQty(riskQty, entryPrice, buyingPower / openIntradaySlots, true);
 
             if (qty === 0) {
                 continue;
             }
 
-            const orderValue = qty * sig.entryPrice;
-            const grossTarget = Math.abs(sig.targetPrice - sig.entryPrice) * qty;
-            const estCharges = calcIntradayRoundTripCharges(sig.entryPrice, sig.targetPrice, qty);
+            const orderValue = qty * entryPrice;
+            const grossTarget = (
+                sig.direction === "BUY"
+                    ? sig.targetPrice - entryPrice
+                    : entryPrice - sig.targetPrice
+            ) * qty;
+            const estCharges = calcIntradayRoundTripCharges(entryPrice, sig.targetPrice, qty);
 
-            if (grossTarget < estCharges * CONFIG.INTRADAY.MIN_REWARD_TO_CHARGES) {
+            if (grossTarget <= 0 || grossTarget < estCharges * CONFIG.INTRADAY.MIN_REWARD_TO_CHARGES) {
                 continue;
             }
 
@@ -1164,7 +1365,7 @@ async function evaluateIntraday(accessToken, positions, macro, orderState, clock
                 quantity: qty,
                 product: "I",
                 validity: "DAY",
-                price: roundToTick(sig.direction === "BUY" ? sig.entryPrice * 1.0015 : sig.entryPrice * 0.9985),
+                price: entryPrice,
                 trigger_price: 0,
                 order_type: "LIMIT",
                 transaction_type: sig.direction,
@@ -1181,7 +1382,7 @@ async function evaluateIntraday(accessToken, positions, macro, orderState, clock
         }
     }
 
-    return { intradayTotalPnL, dailyLossBreached, dailyProfitGoalHit, exitOrders, entryOrders };
+    return { intradayTotalPnL, dailyLossBreached, dailyProfitGoalHit, exitOrders, entryOrders, protectiveStopOrders };
 }
 
 function getSummary(availableCash, deliveryValue, totalValue, intradayPnL, macro) {
@@ -1194,7 +1395,9 @@ function getSummary(availableCash, deliveryValue, totalValue, intradayPnL, macro
         vixRegime: macro.vixRegime,
         nifty50Price: macro.niftyPrice,
         nifty50Trend: macro.isNiftyBullish ? "BULLISH" : "WEAK",
-        nifty50WeeklyTrend: macro.isNiftyWeeklyUp ? "UPTREND" : "DOWNTREND"
+        nifty50WeeklyTrend: macro.isNiftyWeeklyUp ? "UPTREND" : "DOWNTREND",
+        marketDataReady: macro.hasValidDailyContext,
+        intradayDataReady: macro.hasLiveIntradayData
     };
 }
 
@@ -1206,6 +1409,7 @@ export async function execute(accessToken, live = false) {
         throw new Error("Upstox accessToken is required.");
     }
 
+    warnings = [];
     const clock = getISTTime();
     const nifty200 = await getNifty200() ?? [];
 
@@ -1213,12 +1417,26 @@ export async function execute(accessToken, live = false) {
         throw new Error("NIFTY 200 universe is empty");
     }
 
-    const [{ holdings, positions, orders, availableCash }, macro] = await Promise.all([
+    const [{ holdings, positions, orders, availableCash, portfolioDataComplete }, macro] = await Promise.all([
         fetchPortfolio(accessToken),
         getMacroRegime(accessToken)
     ]);
 
-    const orderState = await cancelStaleOrders(accessToken, orders);
+    if (!macro.hasValidDailyContext) {
+        warnings.push("Market context is incomplete or stale; new entries are disabled.");
+    }
+    if (!macro.hasLiveIntradayData) {
+        warnings.push("Current-session Nifty data is unavailable or stale; new entries are disabled.");
+    }
+    if (!portfolioDataComplete) {
+        warnings.push("Portfolio data is incomplete; new entries are disabled.");
+    }
+
+    const executionMacro = portfolioDataComplete
+        ? macro
+        : { ...macro, allowDeliveryBuys: false, allowIntradayTrades: false, sizeScale: 0 };
+
+    const orderState = await cancelStaleOrders(accessToken, orders, live);
     if (orderState.cancelledOrderIds.length > 0) {
         warnings.push(`Cancelled ${orderState.cancelledOrderIds.length} stale intraday entry orders.`);
     }
@@ -1234,7 +1452,7 @@ export async function execute(accessToken, live = false) {
         deliveryMap,
         universeMap,
         metricsMap,
-        macro,
+        executionMacro,
         orderState,
         clock,
         availableCash,
@@ -1245,18 +1463,19 @@ export async function execute(accessToken, live = false) {
     const intradayPlan = await evaluateIntraday(
         accessToken,
         positions,
-        macro,
+        executionMacro,
         orderState,
         clock,
         availableCash,
         totalValue,
-        nifty200
+        nifty200,
+        metricsMap
     );
 
     const plannedOrders = {
         exitOrders: [...deliveryPlan.exitOrders, ...intradayPlan.exitOrders],
         entryOrders: [...deliveryPlan.entryOrders, ...intradayPlan.entryOrders],
-        protectiveStopOrders: [...deliveryPlan.protectiveStopOrders]
+        protectiveStopOrders: [...deliveryPlan.protectiveStopOrders, ...intradayPlan.protectiveStopOrders]
     };
 
     const responses = await executeOrders(accessToken, plannedOrders, live);

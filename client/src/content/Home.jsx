@@ -45,6 +45,7 @@ export default function HomeContent() {
             "Key": d.tradingsymbol,
             "Symbol": d.tradingsymbol,
             "Buy Price": d.buy_price,
+            "Current Price": d.last_price,
             "Quantity": d.quantity,
             "Buy Value": d.buy_value,
             "Current Value": d.value,
@@ -62,6 +63,7 @@ export default function HomeContent() {
             "Company Name": d.company_name,
             "Quantity": d.quantity,
             "Buy Price": d.average_price,
+            "Current Price": d.last_price,
             "Buy Value": (d.quantity * d.average_price).toFixed(2),
             "Current Value": (d.quantity * d.last_price).toFixed(2),
             "Profit N Loss": d.pnl

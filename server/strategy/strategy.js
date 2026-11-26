@@ -1,6 +1,6 @@
 import CONFIG from "./config.js";
 import { getFunds, getHoldings, getOrders, getPositions } from "../service/upstox.js";
-import { getIntradayCandles, getHistoricalIntradayCandles, getHistoricalCandles } from "../service/candles.js";
+import { fetchIntradayCandles, fetchHistoricalIntradayCandles, fetchHistoricalCandles } from "../service/candles.js";
 import { calcDeliveryRoundTripCharges, calcIntradayRoundTripCharges } from "./charges.js";
 import {
     calculateADX,
@@ -13,28 +13,82 @@ import {
     calculateSessionVWAP
 } from "./indicators.js";
 import { cancelStaleOrders, executeOrders } from "./executor.js";
-import { buildWeeklyCandles, getISTTime, roundToTick, sleep, sum } from "./utils.js";
-import { getAllNseEqInstruments } from "../service/instruments.js";
-import NIFTY_100 from "./nifty100.js";
+import { getISTTime, roundToTick, sleep, sum } from "./utils.js";
+import getNifty200 from "../service/nifty200.js";
+
 let warnings = [];
-let instruments = [];
 
 // ============================================================================
 // 1. UNCONSTRAINED POSITION SIZING (RISK-PARITY & BUDGET BOUNDED)
 // ============================================================================
-function calculatePositionQty(rawQty, unitPrice, availableBudget) {
-    if (!unitPrice || unitPrice <= 0 || availableBudget <= 0) {
+function calculatePositionQty(rawQty, unitPrice, availableBudget, isIntraday = false) {
+
+    const minOrderValue = CONFIG.MIN_ORDER_VALUE;
+    const maxOrderValue = isIntraday ? CONFIG.MAX_INTRADAY_ORDER_VALUE : CONFIG.MAX_DELIVERY_ORDER_VALUE;
+    const minShares = isIntraday ? CONFIG.MIN_INTRADAY_SHARES : CONFIG.MIN_DELIVERY_SHARES
+
+    if (!unitPrice || unitPrice <= 0 || availableBudget <= 0 || rawQty <= 0) {
         return 0;
     }
 
-    const maxQtyUnderBudget = Math.floor(availableBudget / unitPrice);
-    const qty = Math.min(rawQty, maxQtyUnderBudget);
+    // 1. Cap effective budget by both available cash and hard MAX_ORDER_VALUE ceiling
+    const effectiveMaxBudget = Math.min(availableBudget, maxOrderValue);
+    const maxQtyAllowed = Math.floor(effectiveMaxBudget / unitPrice);
 
-    if (qty < 1 || qty * unitPrice < CONFIG.MIN_ORDER_VALUE) {
+    // 2. Clamp strategy's risk-parity quantity to the maximum allowed quantity
+    const qty = Math.min(rawQty, maxQtyAllowed);
+    const orderValue = qty * unitPrice;
+
+    // 3. Reject if below minimum share count or minimum rupee floor
+    if (qty < minShares || orderValue < minOrderValue) {
         return 0;
     }
 
     return qty;
+}
+
+function buildWeeklyCandles(dailyCandles) {
+    if (!dailyCandles || dailyCandles.length < 10) {
+        return [];
+    }
+
+    const weeks = [];
+    let currentKey = null;
+    let bucket = null;
+
+    for (const c of dailyCandles) {
+        const d = new Date(c.ts || c.date);
+        const day = d.getUTCDay() || 7;
+        const monday = new Date(d);
+        monday.setUTCDate(d.getUTCDate() - day + 1);
+        const key = monday.toISOString().split("T")[0];
+
+        if (key !== currentKey) {
+            if (bucket) {
+                weeks.push(bucket);
+            }
+            currentKey = key;
+            bucket = {
+                date: key,
+                open: c.open,
+                high: c.high,
+                low: c.low,
+                close: c.close,
+                volume: c.volume
+            };
+        } else {
+            bucket.high = Math.max(bucket.high, c.high);
+            bucket.low = Math.min(bucket.low, c.low);
+            bucket.close = c.close;
+            bucket.volume += c.volume;
+        }
+    }
+
+    if (bucket) {
+        weeks.push(bucket);
+    }
+
+    return weeks;
 }
 
 // ============================================================================
@@ -42,10 +96,11 @@ function calculatePositionQty(rawQty, unitPrice, availableBudget) {
 // ============================================================================
 async function getMacroRegime(accessToken) {
     const [niftyDaily, niftyIntraday1m, vixCandles] = await Promise.all([
-        getHistoricalCandles("NSE_INDEX|Nifty 50", CONFIG.CANDLE_LOOKBACK_DAYS),
-        getIntradayCandles("NSE_INDEX|Nifty 50"),
-        getHistoricalCandles("NSE_INDEX|India VIX", 60)
+        fetchHistoricalCandles("NSE_INDEX|Nifty 50", CONFIG.CANDLE_LOOKBACK_DAYS),
+        fetchIntradayCandles("NSE_INDEX|Nifty 50"),
+        fetchHistoricalCandles("NSE_INDEX|India VIX", 60)
     ]);
+
     const { mergedDaily: niftyCandles } = buildLiveDailySeries(niftyDaily, niftyIntraday1m);
 
     const closes = niftyCandles.map((c) => c.close);
@@ -282,16 +337,17 @@ async function fetchPortfolio(accessToken) {
     const [holdingsRaw, positionsRaw, fundsRaw, ordersRaw] = await Promise.all([
         getHoldings(accessToken),
         getPositions(accessToken),
-        getFunds(accessToken),
+        // getFunds(accessToken),
         getOrders(accessToken)
     ]);
 
     const holdings = Array.isArray(holdingsRaw) ? holdingsRaw : [];
     const positions = Array.isArray(positionsRaw) ? positionsRaw : [];
     const orders = Array.isArray(ordersRaw) ? ordersRaw : [];
-    const availableCash = fundsRaw?.equity?.available_margin ??
-        fundsRaw?.available_to_trade?.total ??
-        0;
+    const availableCash = 30000
+        // fundsRaw?.equity?.available_margin ??
+        // fundsRaw?.available_to_trade?.total ??
+        // 0;
 
     return { holdings, positions, orders, availableCash };
 }
@@ -306,7 +362,7 @@ function consolidateDelivery(holdings, positions) {
 
         deliveryMap.set(h.instrument_token, {
             symbol: h.trading_symbol,
-            instrument_key: h.instrument_token,
+            instrumentKey: h.instrument_token,
             quantity: h.quantity,
             avgPrice: h.average_price,
             lastPrice: h.last_price || h.average_price,
@@ -337,7 +393,7 @@ function consolidateDelivery(holdings, positions) {
             } else {
                 deliveryMap.set(p.instrument_token, {
                     symbol: p.trading_symbol,
-                    instrument_key: p.instrument_token,
+                    instrumentKey: p.instrument_token,
                     quantity: p.quantity,
                     avgPrice: p.average_price,
                     lastPrice: p.last_price || p.average_price,
@@ -360,13 +416,13 @@ function getDeliveryPortfolioValue(deliveryMap) {
     return deliveryValue;
 }
 
-function getUniverseMap(deliveryMap) {
+function getUniverseMap(nifty200, deliveryMap) {
     const universeMap = new Map();
-    instruments.forEach((s) => universeMap.set(s.instrument_key, s));
+    nifty200.forEach((s) => universeMap.set(s.instrumentKey, s));
 
     deliveryMap.forEach((v, k) => {
         if (!universeMap.has(k)) {
-            universeMap.set(k, { symbol: v.symbol, instrument_key: k, sector: "External" });
+            universeMap.set(k, { symbol: v.symbol, instrumentKey: k, sector: "External" });
         }
     });
 
@@ -380,8 +436,8 @@ async function getMetricsMap(universeMap, macro) {
         await sleep(CONFIG.API_DELAY_MS);
 
         const [dailyCandles, intradayCandles1m] = await Promise.all([
-            getHistoricalCandles(key, CONFIG.CANDLE_LOOKBACK_DAYS),
-            getIntradayCandles(key, CONFIG.CANDLE_INTRADAY_INTERVALS)
+            fetchHistoricalCandles(key, CONFIG.CANDLE_LOOKBACK_DAYS),
+            fetchIntradayCandles(key, CONFIG.CANDLE_INTRADAY_INTERVALS)
         ]);
 
         const { mergedDaily, intradayContext } = buildLiveDailySeries(dailyCandles, intradayCandles1m);
@@ -691,7 +747,7 @@ function evaluateIntradaySignal(candles1m, histCandles1m, meta, macro) {
     return {
         symbol: meta.symbol,
         sector: meta.sector,
-        instrument_key: meta.instrument_key,
+        instrumentKey: meta.instrumentKey,
         product: "I",
         direction,
         setup,
@@ -719,7 +775,8 @@ function evaluateDeliverys(
     orderState,
     clock,
     availableCash,
-    totalValue
+    totalValue,
+    nifty200
 ) {
     const exitOrders = [];
     const entryOrders = [];
@@ -782,7 +839,7 @@ function evaluateDeliverys(
                 transaction_type: "SELL",
                 instrument_token: key,
                 disclosed_quantity: 0,
-                tag: "pigkeeper_exit",
+                tag: "pigtrader_exit",
                 _meta: {
                     symbol: held.symbol,
                     netPnL: Number(netPnL.toFixed(2)),
@@ -817,7 +874,7 @@ function evaluateDeliverys(
                     transaction_type: "SELL",
                     instrument_token: key,
                     disclosed_quantity: 0,
-                    tag: "pigkeeper_exit",
+                    tag: "pigtrader_exit",
                     _meta: {
                         symbol: held.symbol,
                         netPnL: Number(harvestNetProfit.toFixed(2)),
@@ -846,7 +903,7 @@ function evaluateDeliverys(
                     transaction_type: "SELL",
                     instrument_token: key,
                     disclosed_quantity: 0,
-                    tag: "pigkeeper_exit",
+                    tag: "pigtrader_exit",
                     _meta: {
                         symbol: held.symbol,
                         netPnL: Number(((price - held.avgPrice) * trimQty - trimCharges).toFixed(2)),
@@ -872,7 +929,7 @@ function evaluateDeliverys(
                 transaction_type: "SELL",
                 instrument_token: key,
                 disclosed_quantity: 0,
-                tag: "pigkeeper_sl",
+                tag: "pigtrader_sl",
                 _meta: { symbol: held.symbol, stopLoss: slTrigger }
             });
         }
@@ -886,8 +943,8 @@ function evaluateDeliverys(
     const inMarketHours = clock.time >= CONFIG.DELIVERY.ENTRY_START_IST && clock.time <= CONFIG.DELIVERY.ENTRY_END_IST;
     if (inMarketHours && macro.allowDeliveryBuys && keptCount < CONFIG.DELIVERY.MAX_HOLDINGS) {
         const candidates = [];
-        for (const stock of instruments) {
-            const m = metricsMap.get(stock.instrument_key);
+        for (const stock of nifty200) {
+            const m = metricsMap.get(stock.instrumentKey);
             if (!m || m.hasSplitAnomaly || m.finalScore < CONFIG.DELIVERY.MIN_SCORE_BUY) {
                 continue;
             }
@@ -896,7 +953,7 @@ function evaluateDeliverys(
                 continue;
             }
 
-            if (deliveryMap.has(stock.instrument_key) || orderState.activeEntryKeys.has(`D:${stock.instrument_key}`)) {
+            if (deliveryMap.has(stock.instrumentKey) || orderState.activeEntryKeys.has(`D:${stock.instrumentKey}`)) {
                 continue;
             }
             candidates.push({ stock, m });
@@ -964,9 +1021,9 @@ function evaluateDeliverys(
                 trigger_price: 0,
                 order_type: "LIMIT",
                 transaction_type: "BUY",
-                instrument_token: stock.instrument_key,
+                instrument_token: stock.instrumentKey,
                 disclosed_quantity: 0,
-                tag: "pigkeeper_entry",
+                tag: "pigtrader_entry",
                 _meta: {
                     symbol: stock.symbol,
                     stopLoss: m.entryStop,
@@ -982,7 +1039,7 @@ function evaluateDeliverys(
 // ============================================================================
 // 7. INTRADAY ('I') EVALUATION (FETCHES BOTH LIVE & 30D 1-MIN CANDLES)
 // ============================================================================
-async function evaluateIntraday(accessToken, positions, macro, orderState, clock, availableCash, totalValue) {
+async function evaluateIntraday(accessToken, positions, macro, orderState, clock, availableCash, totalValue, nifty200) {
     const intradayPositions = positions.filter((p) => p.product === "I" && p.quantity !== 0);
     const intradayTotalPnL = positions
         .filter((p) => p.product === "I")
@@ -1023,7 +1080,7 @@ async function evaluateIntraday(accessToken, positions, macro, orderState, clock
                 transaction_type: isLong ? "SELL" : "BUY",
                 instrument_token: pos.instrument_token,
                 disclosed_quantity: 0,
-                tag: "pigkeeper_exit",
+                tag: "pigtrader_exit",
                 _meta: {
                     symbol: pos.trading_symbol,
                     netPnL: Number(netPosPnL.toFixed(2)),
@@ -1054,18 +1111,18 @@ async function evaluateIntraday(accessToken, positions, macro, orderState, clock
         const signals = [];
 
         // for (const stock of NIFTY_100.slice(0, CONFIG.INTRADAY.UNIVERSE_LIMIT)) {
-        for (const stock of instruments) {
+        for (const stock of nifty200) {
             if (
-                activeIntradayKeys.has(stock.instrument_key) ||
-                orderState.activeEntryKeys.has(`I:${stock.instrument_key}`)
+                activeIntradayKeys.has(stock.instrumentKey) ||
+                orderState.activeEntryKeys.has(`I:${stock.instrumentKey}`)
             ) {
                 continue;
             }
 
             await sleep(75);
             const [candles1m, histCandles1m] = await Promise.all([
-                getIntradayCandles(stock.instrument_key, CONFIG.CANDLE_INTRADAY_INTERVALS),
-                getHistoricalIntradayCandles(stock.instrument_key, 30)
+                fetchIntradayCandles(stock.instrumentKey, CONFIG.CANDLE_INTRADAY_INTERVALS),
+                fetchHistoricalIntradayCandles(stock.instrumentKey, 30)
             ]);
 
             const sig = evaluateIntradaySignal(candles1m, histCandles1m, stock, macro);
@@ -1086,7 +1143,7 @@ async function evaluateIntraday(accessToken, positions, macro, orderState, clock
 
             const riskBudget = totalValue * CONFIG.INTRADAY.RISK_PER_TRADE_PCT * macro.sizeScale;
             const riskQty = Math.floor(riskBudget / sig.stopDist);
-            const qty = calculatePositionQty(riskQty, sig.entryPrice, buyingPower / openIntradaySlots);
+            const qty = calculatePositionQty(riskQty, sig.entryPrice, buyingPower / openIntradaySlots, true);
 
             if (qty === 0) {
                 continue;
@@ -1111,9 +1168,9 @@ async function evaluateIntraday(accessToken, positions, macro, orderState, clock
                 trigger_price: 0,
                 order_type: "LIMIT",
                 transaction_type: sig.direction,
-                instrument_token: sig.instrument_key,
+                instrument_token: sig.instrumentKey,
                 disclosed_quantity: 0,
-                tag: "pigkeeper_entry",
+                tag: "pigtrader_entry",
                 _meta: {
                     symbol: sig.symbol,
                     stopLoss: sig.stopLoss,
@@ -1150,14 +1207,11 @@ export async function execute(accessToken, live = false) {
     }
 
     const clock = getISTTime();
+    const nifty200 = await getNifty200() ?? [];
 
-    warnings = [];
-    instruments = NIFTY_100;
-    // await getAllNseEqInstruments() || [];
-
-    if (!instruments || !instruments.length) {
-        throw new Error("Instruments key are empty");
-    } 
+    if (!nifty200.length) {
+        throw new Error("NIFTY 200 universe is empty");
+    }
 
     const [{ holdings, positions, orders, availableCash }, macro] = await Promise.all([
         fetchPortfolio(accessToken),
@@ -1173,7 +1227,7 @@ export async function execute(accessToken, live = false) {
     const deliveryValue = getDeliveryPortfolioValue(deliveryMap);
     const totalValue = deliveryValue + availableCash;
 
-    const universeMap = getUniverseMap(deliveryMap);
+    const universeMap = getUniverseMap(nifty200, deliveryMap);
     const metricsMap = await getMetricsMap(universeMap, macro);
 
     const deliveryPlan = evaluateDeliverys(
@@ -1184,7 +1238,8 @@ export async function execute(accessToken, live = false) {
         orderState,
         clock,
         availableCash,
-        totalValue
+        totalValue,
+        nifty200
     );
 
     const intradayPlan = await evaluateIntraday(
@@ -1194,19 +1249,9 @@ export async function execute(accessToken, live = false) {
         orderState,
         clock,
         availableCash,
-        totalValue
+        totalValue,
+        nifty200
     );
-
-    if (!live || true) {
-        return {
-            timestampIST: `${clock.date} ${clock.time}`,
-            mode: "DRY_RUN",
-            summary: getSummary(availableCash, deliveryValue, totalValue, intradayPlan.intradayTotalPnL, macro),
-            deliveryPlan,
-            intradayPlan,
-            warnings
-        }
-    }
 
     const plannedOrders = {
         exitOrders: [...deliveryPlan.exitOrders, ...intradayPlan.exitOrders],
@@ -1214,13 +1259,13 @@ export async function execute(accessToken, live = false) {
         protectiveStopOrders: [...deliveryPlan.protectiveStopOrders]
     };
 
-    const responses = await executeOrders(accessToken, plannedOrders);
+    const responses = await executeOrders(accessToken, plannedOrders, live);
 
     console.log(`${clock.date} ${clock.time} : Startegy Completed`);
 
     return {
         timestampIST: `${clock.date} ${clock.time}`,
-        mode: "LIVE",
+        mode: live ? "LIVE" : "DRY_RUN",
         summary: getSummary(availableCash, deliveryValue, totalValue, intradayPlan.intradayTotalPnL, macro),
         deliveryPlan,
         intradayPlan,
@@ -1228,8 +1273,4 @@ export async function execute(accessToken, live = false) {
         responses,
         warnings
     }
-}
-
-export function shouldExecute() {
-
 }

@@ -6,8 +6,12 @@ const CONFIG = {
     INTRADAY_CAPITAL_SHARE: 0.25,     // Reserve 25% of free cash for Daily Intraday (MIS)
     CASH_RESERVE_PCT: 0.08,           // Keep 8% liquidity buffer for drawdowns/opportunities
 
-    // Minimum economic order floor so fixed ₹21.83 DP charge stays < 0.9%
-    MIN_ORDER_VALUE: 2500,
+    // Order Value Corridor (Prevents fee-drag on small orders & overexposure on large orders)
+    MIN_ORDER_VALUE: 4000,            // Keeps ₹21.83 DP charge <= 0.55% of trade value
+    MAX_DELIVERY_ORDER_VALUE: 12000,  // Hard rupee ceiling per new Delivery entry
+    MAX_INTRADAY_ORDER_VALUE: 8000,  // Hard rupee ceiling per Intraday trade
+    MIN_DELIVERY_SHARES: 4,           // Ensures 50% daily profit harvest can always sell >= 1 share
+    MIN_INTRADAY_SHARES: 2,
 
     RISK_FREE_RATE: 0.065,
     CANDLE_LOOKBACK_DAYS: 400,

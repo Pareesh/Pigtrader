@@ -83,7 +83,7 @@ export async function getFunds(accessToken) {
     const json = await res.json().catch(() => ({}));
     
     if (!res.ok) {
-        throw new Error(json.message || json.errors?.[0]?.message || `Positions failed: ${res.status}`);
+        throw new Error(json.message || json.errors?.[0]?.message || `Funds failed: ${res.status}`);
     }
 
     return json.data || [];
@@ -115,6 +115,39 @@ export async function getHoldings(accessToken) {
     }
 
     return json.data || [];
+}
+
+// from and to should be YYYY-MM-DD
+export async function getHistoricalCandles(instrumentKey, to, from, unit = "days", interval = 1) {
+    const key = encodeURIComponent(instrumentKey);
+    const url = `${API_V3}/historical-candle/${key}/${unit}/${interval}/${to}/${from}`;
+
+    const res = await fetch(url);
+
+    const json = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+        throw new Error(json.message || json.errors?.[0]?.message || `Historical candles failed: ${res.status}`);
+    }
+
+    // Upstox returns newest candle first -> reverse so oldest is index 0
+    return json.data?.candles || [];
+}
+
+export async function getIntradayCandles(instrumentKey, unit = "minutes", interval = 1) {
+    const key = encodeURIComponent(instrumentKey);
+    const url = `${API_V3}/historical-candle/intraday/${key}/minutes/${interval}`;
+
+    const res = await fetch(url);
+
+    const json = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+        throw new Error(json.message || json.errors?.[0]?.message || `Intraday candles failed: ${res.status}`);
+    }
+
+    // Upstox returns newest candle first -> reverse so oldest is index 0
+    return json.data?.candles || [];
 }
 
 export async function convertPositions(accessToken, order) {
@@ -150,7 +183,7 @@ export async function getOrders(accessToken) {
     return json.data || [];
 }
 
-export async function placeMultipleOrder(accessToken, orders = []) {
+export async function placeMultipleOrder(accessToken, orders = [], live = false) {
     if (!accessToken) {
         throw new Error("Upstox access token is required.");
     }
@@ -161,21 +194,23 @@ export async function placeMultipleOrder(accessToken, orders = []) {
 
     const CHUNK_SIZE = 5;
     const responses = [];
+    const ordersCopy = structuredClone(orders);
 
-    orders.forEach((o ,i) => {
-        o.correlation_id = o.correlation_id || `pigkeeper-correlation-${i}`
+    ordersCopy.forEach((o ,i) => {
+        o.correlation_id = o.correlation_id || `pigtrader-correlation-${i}`
     });
 
-    for (let i = 0; i < orders.length; i += CHUNK_SIZE) {
-        const chunk = orders.slice(i, i + CHUNK_SIZE);
+    for (let i = 0; i < ordersCopy.length; i += CHUNK_SIZE) {
+        const chunk = ordersCopy.slice(i, i + CHUNK_SIZE);
+
+        if (!live) {
+            responses.push(chunk);
+            continue;
+        }
 
         const res = await fetch(`${API_V2}/order/multi/place`, {
             method: "POST",
-            headers: {
-                Authorization: `Bearer ${accessToken}`,
-                Accept: "application/json",
-                "Content-Type": "application/json"
-            },
+            headers: getHeaders(accessToken),
             body: JSON.stringify(chunk)
         });
 

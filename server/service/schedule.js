@@ -145,7 +145,7 @@ export function startTrading() {
         return;
     }
 
-    console.log("PigKeeper Trading mounted (Market window: 09:16 - 15:22 IST).");
+    console.log("PigTrader mounted (Market window: 09:16 - 15:22 IST).");
     executeMarketTick();
     intervalId = setInterval(executeMarketTick, TICK_INTERVAL_MS);
 }
@@ -154,6 +154,6 @@ export function stopTrading() {
     if (intervalId) {
         clearInterval(intervalId);
         intervalId = null;
-        console.log("PigKeeper Trading stopped.");
+        console.log("PigTrader stopped.");
     }
 }

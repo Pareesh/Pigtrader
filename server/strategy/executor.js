@@ -5,7 +5,7 @@ import { roundToTick, sleep } from "./utils.js";
 // ============================================================================
 // BROKER ORDER HYGIENE (CANCEL STALE ORDERS & PREVENT DUPLICATES)
 // ============================================================================
-export async function cancelStaleOrders(accessToken, orders) {
+export async function cancelStaleOrders(accessToken, orders, live = false) {
     const activeEntryKeys = new Set();
     const activeExitKeys = new Set();
     const activeStopLossKeys = new Set();
@@ -25,14 +25,19 @@ export async function cancelStaleOrders(accessToken, orders) {
         const ageMinutes = (nowMs - orderTimeMs) / 60000;
 
         // Auto-cancel stale unfilled Intraday ('I') entry LIMIT orders older than 15 minutes
-        if (
-            ord.product === "I" &&
+        if (ord.product === "I" &&
             orderType === "LIMIT" &&
-            tag === "pigkeeper_entry" &&
+            tag === "pigtrader_entry" &&
             ageMinutes > CONFIG.INTRADAY.STALE_ORDER_MINUTES
         ) {
-            try {
-                const orderId = ord.order_id;
+            const orderId = ord.order_id;
+
+            if (!live) {
+                cancelledOrderIds.push(orderId);
+                continue;
+            }
+
+            try {                
                 await cancelOrder(accessToken, orderId)
                 cancelledOrderIds.push(orderId);
                 continue;
@@ -43,7 +48,7 @@ export async function cancelStaleOrders(accessToken, orders) {
 
         if (orderType === "SL" || orderType === "SL-M") {
             activeStopLossKeys.add(`${ord.product}:${key}`);
-        } else if (tag === "pigkeeper_exit") {
+        } else if (tag === "pigtrader_exit") {
             activeExitKeys.add(`${ord.product}:${key}`);
         } else {
             activeEntryKeys.add(`${ord.product}:${key}`);
@@ -53,7 +58,7 @@ export async function cancelStaleOrders(accessToken, orders) {
     return { activeEntryKeys, activeExitKeys, activeStopLossKeys, cancelledOrderIds };
 }
 
-export async function executeOrders(accessToken, { exitOrders, entryOrders, protectiveStopOrders }) {
+export async function executeOrders(accessToken, { exitOrders, entryOrders, protectiveStopOrders }, live = false) {
     const stripMeta = (list) => list.map(({ _meta, ...payload }) => payload);
     const executionReport = { exits: [], entries: [], stopLosses: [] };
     let corrId = 900;
@@ -61,12 +66,12 @@ export async function executeOrders(accessToken, { exitOrders, entryOrders, prot
     try {
         // 1. Submit Exits first to free up capital & margin
         if (exitOrders.length > 0) {
-            executionReport.exits = await placeMultipleOrder(accessToken, stripMeta(exitOrders));
+            executionReport.exits = await placeMultipleOrder(accessToken, stripMeta(exitOrders), live);
         }
 
         // 2. Submit buffered LIMIT Entries second
         if (entryOrders.length > 0) {
-            executionReport.entries = await placeMultipleOrder(accessToken, stripMeta(entryOrders));
+            executionReport.entries = await placeMultipleOrder(accessToken, stripMeta(entryOrders), live);
 
             // 3. Verify order book after 3 seconds so protective SL attaches only to valid entries
             await sleep(3000);
@@ -76,7 +81,7 @@ export async function executeOrders(accessToken, { exitOrders, entryOrders, prot
             const validEntryTokens = new Set((Array.isArray(refreshedOrders) ? refreshedOrders : [])
                 .filter(
                     (o) =>
-                        o.tag === "pigkeeper_entry" &&
+                        o.tag === "pigtrader_entry" &&
                         !["rejected", "cancelled"].includes(String(o.status).toLowerCase())
                 )
                 .map((o) => `${o.product}:${o.instrument_token}`)
@@ -100,7 +105,7 @@ export async function executeOrders(accessToken, { exitOrders, entryOrders, prot
                     transaction_type: isLong ? "SELL" : "BUY",
                     instrument_token: ent.instrument_token,
                     disclosed_quantity: 0,
-                    tag: "pigkeeper_sl",
+                    tag: "pigtrader_sl",
                     _meta: { symbol: ent._meta.symbol, stopLoss: trigger }
                 });
             }
@@ -108,7 +113,7 @@ export async function executeOrders(accessToken, { exitOrders, entryOrders, prot
 
         // 4. Submit all Protective Stop-Loss ('SL') orders
         if (protectiveStopOrders.length > 0) {
-            executionReport.stopLosses = await placeMultipleOrder(accessToken, stripMeta(protectiveStopOrders));
+            executionReport.stopLosses = await placeMultipleOrder(accessToken, stripMeta(protectiveStopOrders), live);
         }
     } catch (err) {
         console.error(err);

@@ -2,9 +2,8 @@ import { Router } from 'express';
 import { verifyOrigin } from '../middleware/cors.js';
 import { verifyUpstoxSession } from '../middleware/upstox.js';
 import { getFunds, getPositions, getOrders, getHoldings } from '../service/upstox.js';
-import { execute } from '../strategy/strategy.js';
-import { getHistoricalCandles } from '../service/candles.js';
-import { getAllNseEqInstruments } from '../service/instruments.js';
+import { fetchHistoricalCandles } from '../service/candles.js';
+import getNifty200 from '../service/nifty200.js';
 
 export const router = Router();
 
@@ -41,16 +40,6 @@ router.get("/orders", async (req, res) => {
     }
 });
 
-router.get("/strategy", async (req, res) => {
-    try {
-        const strategies = await execute(req.upstoxAccessToken, true);
-        res.json(strategies);
-    } catch (e) {
-        console.log(e);
-        res.status(500).json({ error: "Unable to retrieve strategies" });
-    }
-});
-
 router.get("/holdings", async (req, res) => {
     try {
         const holdings = await getHoldings(req.upstoxAccessToken);  
@@ -65,7 +54,7 @@ router.get("/candles/:instrumentKey", async (req, res) => {
     try {
         const { instrumentKey } = req.params;
 
-        const candles = await getHistoricalCandles(instrumentKey);  
+        const candles = await fetchHistoricalCandles(instrumentKey);  
         res.json(candles);
     } catch (e) {
         console.log(e);
@@ -73,11 +62,10 @@ router.get("/candles/:instrumentKey", async (req, res) => {
     }
 });
 
-router.get("/allnseeqinstruments", async (req, res) => {
+router.get("/nifty200", async (req, res) => {
     try {
-        const allnseeqinstruments = await getAllNseEqInstruments(); 
-        console.log(allnseeqinstruments.length); 
-        res.json(allnseeqinstruments);
+        const nifty200 = await getNifty200(); 
+        res.json(nifty200);
     } catch (e) {
         console.log(e);
         res.status(500).json({ error: "Unable to retrieve intruments" });

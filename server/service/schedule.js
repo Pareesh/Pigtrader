@@ -64,7 +64,7 @@ async function getValidAccessToken() {
             throw new Error("Not connected to Upstox. Complete OAuth first.");
         }
 
-        const profile = getUserProfile(token);
+        const profile = await getUserProfile(token);
 
         if (!profile) {
             throw new Error("Re-connect to Upstox.");

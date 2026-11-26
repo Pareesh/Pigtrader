@@ -31,7 +31,7 @@ export async function fetchHistoricalCandles(instrumentKey, daysBack = 400) {
     const to = new Date();
     const from = new Date(to.getTime() - daysBack * 86400000);
 
-    const cacheKey = `${instrumentKey}-${from}-${to}`;
+    const cacheKey = `${instrumentKey}-${dateString(from)}-${dateString(to)}`;
     const storedValue = candles1d.getValue(cacheKey);
 
     if (storedValue) {
@@ -61,7 +61,7 @@ export async function fetchHistoricalCandles(instrumentKey, daysBack = 400) {
 export async function fetchHistoricalIntradayCandles(instrumentKey, daysBack = 30) {
     const to = new Date();
     const from = new Date(to.getTime() - Math.min(daysBack, 30) * 86400000);
-    const cacheKey = `${instrumentKey}-${from}-${to}`;
+    const cacheKey = `${instrumentKey}-${dateString(from)}-${dateString(to)}`;
 
     const storedValue = candles1m.getValue(cacheKey);
 
@@ -83,7 +83,7 @@ export async function fetchHistoricalIntradayCandles(instrumentKey, daysBack = 3
 }
 
 export async function fetchIntradayCandles(instrumentKey, interval = 1) {
-    const cacheKey = `${instrumentKey}`;
+    const cacheKey = `${instrumentKey}-${interval}`;
 
     const storedValue = intradayCandles1m.getValue(cacheKey);
 

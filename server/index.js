@@ -44,7 +44,7 @@ console.log(buildPath);
 const server = app.listen(config.port, config.host, () => {
     console.log(`API http://${config.host}:${config.port}`);
     try {
-        // startTrading();
+        startTrading();
     } catch (e) {
         console.warn("Scheduler not started:", e.message);
     }

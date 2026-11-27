@@ -29,5 +29,4 @@ dist-ssr
 *.sln
 *.sw?
 
-#zip code
-pigkeeper-trader.zip
+package-lock.json

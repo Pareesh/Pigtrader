@@ -13,7 +13,8 @@ router.get("/profile", async (req, res) => {
     try {
         const profile = await getUserProfile(req.upstoxAccessToken);
         return res.json({ profile: profile.data ?? profile });
-    } catch {
+    } catch(err) {
+        console.error(err);
         return res.json({ profile: null });
     }
 });

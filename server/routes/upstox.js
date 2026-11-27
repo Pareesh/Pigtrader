@@ -1,36 +1,32 @@
 import { Router } from 'express';
 import { verifyConfiguration } from '../middleware/upstox.js';
-import { saveAccessToken, loadAccessToken, clearAccessToken } from '../service/tokenStore.js';
-import { getAuthURL, getAccessTokenFromCode, getUserProfile } from '../service/upstox.js';
+import { saveAccessToken } from '../service/tokenStore.js';
+import { getAuthURL, getAccessTokenFromCode } from '../service/upstox.js';
 
 export const router = Router();
 
 router.use(verifyConfiguration);
 
 router.get("/login", (req, res) => {
-    console.log("LOGIN BEGINS");
-    const url = getAuthURL(req.query.state);
-    console.log(url);
-    res.redirect(url);
+    res.redirect(getAuthURL(req.query.state));
 });
-        
-router.get("/callback", async (req, res) => {
-    const code = req.query.code;
-    const err = req.query.error;
 
-    if (err) {
-        return res.redirect(`/?error=${encodeURIComponent(err)}`);
+router.get("/callback", async (req, res) => {
+    const { code, error } = req.query;
+    const fail = (reason) => res.redirect(`/?error=${encodeURIComponent(reason)}`);
+
+    if (error) {
+        return fail(error);
     }
 
     if (!code || typeof code !== "string") {
-        return res.redirect(`/?error=${encodeURIComponent("missing_code")}`);
+        return fail("missing_code");
     }
 
     try {
-        const token = await getAccessTokenFromCode(code);
-        await saveAccessToken(token);
-        return res.redirect(`http://localhost:5173`);
+        await saveAccessToken(await getAccessTokenFromCode(code));
+        return res.redirect("/");
     } catch (e) {
-        return res.redirect(`/?error=${encodeURIComponent(e.message)}`);
+        return fail(e.message);
     }
-})
+});

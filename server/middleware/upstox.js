@@ -29,7 +29,7 @@ export async function verifyUpstoxSession(req, res, next) {
             return res.status(401).json({ error: "Not connected to Upstox. Complete OAuth first." });
         }
 
-        const profile = getUserProfile(token);
+        const profile = await getUserProfile(token);
 
         if (!profile) {
             return res.status(401).json({ error: "Re-connect to Upstox." });

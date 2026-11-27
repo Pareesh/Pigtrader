@@ -3,241 +3,143 @@ import config from "../config.js";
 
 const API_V2 = "https://api.upstox.com/v2";
 const API_V3 = "https://api.upstox.com/v3";
-const APIHFT_V3 = "https://api-hft.upstox.com/v3";
 
-function cryptoRandomState() {
-  return crypto.randomBytes(16).toString("hex");
-}
-
-function getHeaders(accessToken, extra = {}) {
-    const h = {
+function getHeaders(accessToken) {
+    const headers = {
         Authorization: `Bearer ${accessToken}`,
         Accept: "application/json",
-        "Content-Type": "application/json",
-        ...extra,
+        "Content-Type": "application/json"
     };
-    
+
     if (config.upstox.algoName) {
-        h["X-Algo-Name"] = config.upstox.algoName;
+        headers["X-Algo-Name"] = config.upstox.algoName;
     }
-    return h;
+    return headers;
 }
 
-export function getAuthURL(state) {
-  const params = new URLSearchParams({
-    response_type: "code",
-    client_id: config.upstox.apiKey,
-    redirect_uri: config.upstox.redirectUri,
-    state: state || cryptoRandomState(),
-  });
-
-  return `${API_V2}/login/authorization/dialog?${params.toString()}`;
-}
-
-export async function getAccessTokenFromCode(code) {
-    const body = new URLSearchParams({
-        code,
-        client_id: config.upstox.apiKey,
-        client_secret: config.upstox.apiSecret,
-        redirect_uri: config.upstox.redirectUri,
-        grant_type: "authorization_code",
-    });
-    
-    const res = await fetch(`${API_V2}/login/authorization/token`, {
-        method: "POST",
-        headers: {
-            accept: "application/json",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body,
-    });
-  
+// Single place for fetch + JSON parsing + error extraction. Omit accessToken for public endpoints.
+async function call(url, label, { accessToken, ...init } = {}) {
+    const res = await fetch(url, accessToken ? { ...init, headers: getHeaders(accessToken) } : init);
     const json = await res.json().catch(() => ({}));
-    
-    if (!res.ok) {
-        throw new Error(json.message || json.error || `Token exchange failed: ${res.status}`);
-    }
-  
-    return json.access_token;
-}
 
-export async function getUserProfile(accessToken) {
-    const res = await fetch(`${API_V2}/user/profile`, {
-        headers: getHeaders(accessToken),
-    });
-    
-    const json = await res.json().catch(() => ({}));
-    
     if (!res.ok) {
-        throw new Error(json.message || json.errors?.[0]?.message || `Profile failed: ${res.status}`);
+        throw new Error(json.message || json.errors?.[0]?.message || `${label} failed: ${res.status}`);
     }
-
     return json;
 }
 
-export async function getFunds(accessToken) {
-    const res = await fetch(`${API_V3}/user/get-funds-and-margin`, {
-        headers: getHeaders(accessToken),
+// ----------------------------------------------------------------------------
+// OAuth & profile
+// ----------------------------------------------------------------------------
+export function getAuthURL(state) {
+    const params = new URLSearchParams({
+        response_type: "code",
+        client_id: config.upstox.apiKey,
+        redirect_uri: config.upstox.redirectUri,
+        state: state || crypto.randomBytes(16).toString("hex")
     });
+    return `${API_V2}/login/authorization/dialog?${params}`;
+}
 
-    const json = await res.json().catch(() => ({}));
-    
-    if (!res.ok) {
-        throw new Error(json.message || json.errors?.[0]?.message || `Funds failed: ${res.status}`);
+export async function getAccessTokenFromCode(code) {
+    const json = await call(`${API_V2}/login/authorization/token`, "Token exchange", {
+        method: "POST",
+        headers: { accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+            code,
+            client_id: config.upstox.apiKey,
+            client_secret: config.upstox.apiSecret,
+            redirect_uri: config.upstox.redirectUri,
+            grant_type: "authorization_code"
+        })
+    });
+    return json.access_token;
+}
+
+export const getUserProfile = async (accessToken) => {
+    try {
+        return await call(`${API_V2}/user/profile`, "Profile", { accessToken });
+    } catch(err) {
+        return null;
     }
 
-    return json.data || [];
+}
+
+// ----------------------------------------------------------------------------
+// Portfolio
+// ----------------------------------------------------------------------------
+export async function getFunds(accessToken) {
+    return (await call(`${API_V3}/user/get-funds-and-margin`, "Funds", { accessToken })).data ?? null;
 }
 
 export async function getPositions(accessToken) {
-    const res = await fetch(`${API_V2}/portfolio/short-term-positions`, {
-        headers: getHeaders(accessToken),
-    });
-
-    const json = await res.json().catch(() => ({}));
-
-    if (!res.ok) {
-        throw new Error(json.message || json.errors?.[0]?.message || `Positions failed: ${res.status}`);
-    }
-
-    return json.data || [];
+    return (await call(`${API_V2}/portfolio/short-term-positions`, "Positions", { accessToken })).data || [];
 }
 
 export async function getHoldings(accessToken) {
-    const res = await fetch(`${API_V2}/portfolio/long-term-holdings`, {
-        headers: getHeaders(accessToken),
-    });
-
-    const json = await res.json().catch(() => ({}));
-
-    if (!res.ok) {
-        throw new Error(json.message || json.errors?.[0]?.message || `Positions failed: ${res.status}`);
-    }
-
-    return json.data || [];
-}
-
-// from and to should be YYYY-MM-DD
-export async function getHistoricalCandles(instrumentKey, to, from, unit = "days", interval = 1) {
-    const key = encodeURIComponent(instrumentKey);
-    const url = `${API_V3}/historical-candle/${key}/${unit}/${interval}/${to}/${from}`;
-
-    const res = await fetch(url);
-
-    const json = await res.json().catch(() => ({}));
-
-    if (!res.ok) {
-        throw new Error(json.message || json.errors?.[0]?.message || `Historical candles failed: ${res.status}`);
-    }
-
-    // Upstox returns newest candle first -> reverse so oldest is index 0
-    return json.data?.candles || [];
-}
-
-export async function getIntradayCandles(instrumentKey, unit = "minutes", interval = 1) {
-    const key = encodeURIComponent(instrumentKey);
-    const url = `${API_V3}/historical-candle/intraday/${key}/minutes/${interval}`;
-
-    const res = await fetch(url);
-
-    const json = await res.json().catch(() => ({}));
-
-    if (!res.ok) {
-        throw new Error(json.message || json.errors?.[0]?.message || `Intraday candles failed: ${res.status}`);
-    }
-
-    // Upstox returns newest candle first -> reverse so oldest is index 0
-    return json.data?.candles || [];
-}
-
-export async function convertPositions(accessToken, order) {
-    // @todo complete this method
-    const body = {
-
-    };
-
-    const res = await fetch(`${API_V2}portfolio/convert-position`, {
-        headers: getHeaders(accessToken),
-    });
-
-    const json = await res.json().catch(() => ({}));
-
-    if (!res.ok) {
-        throw new Error(json.message || json.errors?.[0]?.message || `Positions failed: ${res.status}`);
-    }
-
-    return json.data || [];
+    return (await call(`${API_V2}/portfolio/long-term-holdings`, "Holdings", { accessToken })).data || [];
 }
 
 export async function getOrders(accessToken) {
-    const res = await fetch(`${API_V2}/order/retrieve-all`, {
-        headers: getHeaders(accessToken),
-    });
-
-    const json = await res.json().catch(() => ({}));
-
-    if (!res.ok) {
-        throw new Error(json.message || json.errors?.[0]?.message || `Orders failed: ${res.status}`);
-    }
-    
-    return json.data || [];
+    return (await call(`${API_V2}/order/retrieve-all`, "Orders", { accessToken })).data || [];
 }
 
+// ----------------------------------------------------------------------------
+// Market data (public endpoints). Rows are [ts, open, high, low, close, volume, oi], newest first.
+// ----------------------------------------------------------------------------
+// from and to must be YYYY-MM-DD
+export async function getHistoricalCandles(instrumentKey, to, from, unit = "days", interval = 1) {
+    const url = `${API_V3}/historical-candle/${encodeURIComponent(instrumentKey)}/${unit}/${interval}/${to}/${from}`;
+    return (await call(url, "Historical candles")).data?.candles || [];
+}
+
+export async function getIntradayCandles(instrumentKey, unit = "minutes", interval = 1) {
+    const url = `${API_V3}/historical-candle/intraday/${encodeURIComponent(instrumentKey)}/${unit}/${interval}`;
+    return (await call(url, "Intraday candles")).data?.candles || [];
+}
+
+// ----------------------------------------------------------------------------
+// Orders
+// ----------------------------------------------------------------------------
+const ORDER_CHUNK_SIZE = 5;
+
+// Returns { placed, errors }. With live = false nothing is sent and `placed` echoes the payloads.
 export async function placeMultipleOrder(accessToken, orders = [], live = false) {
     if (!accessToken) {
         throw new Error("Upstox access token is required.");
     }
-
     if (!Array.isArray(orders) || orders.length === 0) {
         throw new Error("At least one order is required.");
     }
 
-    const CHUNK_SIZE = 5;
-    const responses = [];
-    const ordersCopy = structuredClone(orders);
+    const payloads = structuredClone(orders).map((o, i) => ({
+        ...o,
+        correlation_id: o.correlation_id || `pigtrader-${i}`
+    }));
 
-    ordersCopy.forEach((o ,i) => {
-        o.correlation_id = o.correlation_id || `pigtrader-correlation-${i}`
-    });
+    if (!live) {
+        return { placed: payloads, errors: [] };
+    }
 
-    for (let i = 0; i < ordersCopy.length; i += CHUNK_SIZE) {
-        const chunk = ordersCopy.slice(i, i + CHUNK_SIZE);
-
-        if (!live) {
-            responses.push(chunk);
-            continue;
-        }
-
-        const res = await fetch(`${API_V2}/order/multi/place`, {
+    const placed = [];
+    const errors = [];
+    for (let i = 0; i < payloads.length; i += ORDER_CHUNK_SIZE) {
+        const json = await call(`${API_V2}/order/multi/place`, "Order batch", {
+            accessToken,
             method: "POST",
-            headers: getHeaders(accessToken),
-            body: JSON.stringify(chunk)
+            body: JSON.stringify(payloads.slice(i, i + ORDER_CHUNK_SIZE))
         });
 
-        const json = await res.json().catch(() => ({}));
-
-        if (!res.ok) {
-            throw new Error(json.message || json.errors?.[0]?.message || `Order batch failed: ${res.status}`);
+        placed.push(...(json.data || []));
+        // A batch can be partially accepted; surface per-order rejections instead of hiding them.
+        for (const e of json.errors || []) {
+            errors.push(`${e.correlation_id ?? "order"}: ${e.message ?? JSON.stringify(e)}`);
         }
-
-        responses.push(...(json.data || []));
     }
-    return responses;
+    return { placed, errors };
 }
 
 export async function cancelOrder(accessToken, orderId) {
-    const res = await fetch(`${API_V2}/order/cancel?order_id=${encodeURIComponent(orderId)}`, {
-        headers: getHeaders(accessToken),
-        method: "DELETE",
-    });
-
-    const json = await res.json().catch(() => ({}));
-
-    if (!res.ok) {
-        throw new Error(json.message || json.errors?.[0]?.message || `Orders Cancellation failed: ${res.status}`);
-    }
-    
-    console.log(json.data);
-
-    return json.data || "";
+    const url = `${API_V2}/order/cancel?order_id=${encodeURIComponent(orderId)}`;
+    return (await call(url, "Order cancellation", { accessToken, method: "DELETE" })).data || "";
 }

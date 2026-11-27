@@ -1,8 +1,8 @@
 import CONFIG from "./config.js";
-// ============================================================================
-// 3. HIDDEN CHARGES & STATUTORY FEE CALCULATORS
-// ============================================================================
-export function calcDeliveryRoundTripCharges(buyPrice, sellPrice, qty) {
+
+const C = CONFIG.CHARGES;
+
+function roundTripCharges(buyPrice, sellPrice, qty, delivery) {
     if (qty <= 0) {
         return 0;
     }
@@ -11,38 +11,23 @@ export function calcDeliveryRoundTripCharges(buyPrice, sellPrice, qty) {
     const sellVal = sellPrice * qty;
     const turnover = buyVal + sellVal;
 
-    const brokerage =
-        Math.min(CONFIG.CHARGES.DELIVERY_BROKERAGE_MAX, buyVal * 0.025) +
-        Math.min(CONFIG.CHARGES.DELIVERY_BROKERAGE_MAX, sellVal * 0.025);
+    const maxFee = delivery ? C.DELIVERY_BROKERAGE_MAX : C.INTRADAY_BROKERAGE_MAX;
+    const rate = delivery ? C.DELIVERY_BROKERAGE_RATE : C.INTRADAY_BROKERAGE_RATE;
+    const brokerage = Math.min(maxFee, buyVal * rate) + Math.min(maxFee, sellVal * rate);
 
-    const stt = turnover * CONFIG.CHARGES.DELIVERY_STT_RATE;
-    const txn = turnover * CONFIG.CHARGES.NSE_TXN_RATE;
-    const sebi = turnover * CONFIG.CHARGES.SEBI_TURNOVER_RATE;
-    const stamp = buyVal * CONFIG.CHARGES.DELIVERY_STAMP_RATE;
-    const gst = (brokerage + txn + sebi) * CONFIG.CHARGES.GST_RATE;
-    const dp = CONFIG.CHARGES.DP_CHARGE_WITH_GST;
+    const stt = delivery ? turnover * C.DELIVERY_STT_RATE : sellVal * C.INTRADAY_STT_RATE;
+    const txn = turnover * C.NSE_TXN_RATE;
+    const sebi = turnover * C.SEBI_TURNOVER_RATE;
+    const stamp = buyVal * (delivery ? C.DELIVERY_STAMP_RATE : C.INTRADAY_STAMP_RATE);
+    const gst = (brokerage + txn + sebi) * C.GST_RATE;
+    const dp = delivery ? C.DP_CHARGE_WITH_GST : 0;
 
     return brokerage + stt + txn + sebi + stamp + gst + dp;
 }
 
-export function calcIntradayRoundTripCharges(entryPrice, exitPrice, qty) {
-    if (qty <= 0) {
-        return 0;
-    }
+// Pass the real buy and sell prices. For an intraday short, the buy price is the (lower) exit.
+export const calcDeliveryRoundTripCharges = (buyPrice, sellPrice, qty) =>
+    roundTripCharges(buyPrice, sellPrice, qty, true);
 
-    const buyVal = Math.min(entryPrice, exitPrice) * qty;
-    const sellVal = Math.max(entryPrice, exitPrice) * qty;
-    const turnover = buyVal + sellVal;
-
-    const brokerage =
-        Math.min(CONFIG.CHARGES.INTRADAY_BROKERAGE_MAX, buyVal * 0.0005) +
-        Math.min(CONFIG.CHARGES.INTRADAY_BROKERAGE_MAX, sellVal * 0.0005);
-
-    const stt = sellVal * CONFIG.CHARGES.INTRADAY_STT_RATE;
-    const txn = turnover * CONFIG.CHARGES.NSE_TXN_RATE;
-    const sebi = turnover * CONFIG.CHARGES.SEBI_TURNOVER_RATE;
-    const stamp = buyVal * CONFIG.CHARGES.INTRADAY_STAMP_RATE;
-    const gst = (brokerage + txn + sebi) * CONFIG.CHARGES.GST_RATE;
-
-    return brokerage + stt + txn + sebi + stamp + gst;
-}
+export const calcIntradayRoundTripCharges = (buyPrice, sellPrice, qty) =>
+    roundTripCharges(buyPrice, sellPrice, qty, false);

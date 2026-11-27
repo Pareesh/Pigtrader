@@ -2,8 +2,8 @@ import config from '../config/config.js';
 
 export async function fetchJson(endpoint, options = {}) {
     try {
-        const origin = config.server.origin;
-        const response = await fetch(`${origin}${endpoint}`, options)
+        console.log(endpoint);
+        const response = await fetch(`${endpoint}`, options)
         const payload = await response.json()
 
         if (!response.ok) {

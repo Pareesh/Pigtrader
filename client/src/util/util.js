@@ -1,9 +1,6 @@
-import config from '../config/config.js';
-
 export async function fetchJson(endpoint, options = {}) {
     try {
-        console.log(endpoint);
-        const response = await fetch(`${endpoint}`, options)
+        const response = await fetch(endpoint, options)
         const payload = await response.json()
 
         if (!response.ok) {
